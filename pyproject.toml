@@ -1,0 +1,18 @@
+[project]
+name = "deepseek-cc-proxy"
+version = "0.1.0"
+description = "Rewrite Claude Code requests so DeepSeek's Anthropic-compatible API accepts them"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "httpx>=0.28.1",
+    "starlette>=1.2.0",
+    "uvicorn>=0.48.0",
+]
+
+[tool.uv]
+package = false
+
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
