@@ -311,6 +311,8 @@ async def proxy(request: Request) -> StreamingResponse:
                     sse_parse(chunk)
                 else:
                     raw_chunks.append(chunk)
+        except httpx.RemoteProtocolError:
+            pass
         finally:
             await upstream_resp.aclose()
             await client.aclose()
