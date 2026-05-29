@@ -4,57 +4,16 @@
 
 ## 解决什么问题
 
-Claude Code **v2.1.154+** 改了对话 API 的请求结构,会在 `messages` 数组中间插入 `role: "system"` 的消息。而 DeepSeek 的 Anthropic 兼容层只接受 `user` / `assistant`,于是报错:
+DeepSeek 的 Anthropic 兼容层 (`/anthropic`) 与标准 Claude API 协议存在四个差异，直接使用会导致 `400 Bad Request` 等错误。本代理在本地逐一修正：
 
-```
-API Error: 400 Failed to deserialize the JSON body into the target type:
-messages[1].role: unknown variant `system`, expected `user` or `assistant`
-```
+1. **System 消息清洗** — DeepSeek 不接受 `messages` 中的 `role: "system"`，代理自动将其合并到顶层 `system` 字段
+2. **Thinking 块注入** — DeepSeek 要求每条 assistant 消息都包含 `thinking` 块（含合法 `signature`），代理缓存真实 thinking 并自动注入缺失的消息
+3. **Streaming 响应缓存** — 在流式 (SSE) 响应中实时解析并缓存 thinking 内容，供下一轮请求复用
+4. **Adaptive Thinking 修正** — 将 `thinking.type = "adaptive"` 转为 `"enabled"`，因为 DeepSeek 不支持 adaptive 模式
 
-本代理夹在 Claude Code 与 DeepSeek 之间,**把 `messages` 里所有 `role: "system"` 的消息剥离、合并进顶层 `system` 字段**,再转发给 DeepSeek。这样既不用降级 Claude Code,也不用等 DeepSeek 兼容新结构。
-
-### 请求改写示意
-
-改写前(Claude Code v2.1.154+ 发出):
-
-```json
-{
-  "system": "You are Claude Code.",
-  "messages": [
-    { "role": "user", "content": "hi" },
-    { "role": "system", "content": "mid-conversation note" },
-    { "role": "assistant", "content": "hello" }
-  ]
-}
-```
-
-改写后(转发给 DeepSeek):
-
-```json
-{
-  "system": [
-    { "type": "text", "text": "You are Claude Code." },
-    { "type": "text", "text": "mid-conversation note" }
-  ],
-  "messages": [
-    { "role": "user", "content": "hi" },
-    { "role": "assistant", "content": "hello" }
-  ]
-}
-```
-
-## 特性
-
-- 仅改写 `messages` 中的 `system` 消息,其余请求体原样保留;没有中间 `system` 消息时零改动。
-- 流式(SSE)与非流式响应都通过 `aiter_raw` 原样透传。
-- 鉴权头(`x-api-key` / `authorization`)等完整透传给上游。
-- 单文件实现(`main.py`),依赖仅 `starlette` + `uvicorn` + `httpx`。
-
-## 使用
+## 快速开始
 
 ### 1. 启动代理
-
-需要一个常驻终端运行:
 
 ```powershell
 cd D:\code\python\deepseek-cc-proxy
@@ -65,7 +24,7 @@ uv run main.py
 
 ### 2. 配置 Claude Code
 
-编辑 `~/.claude/settings.json`,把 `ANTHROPIC_BASE_URL` 指向本代理,其余配置(`ANTHROPIC_AUTH_TOKEN`、各模型映射等)保持不变:
+编辑 `~/.claude/settings.json`，把 `ANTHROPIC_BASE_URL` 指向本代理，其余配置（`ANTHROPIC_AUTH_TOKEN`、模型映射等）保持不变：
 
 ```json
 {
@@ -80,7 +39,7 @@ uv run main.py
 }
 ```
 
-鉴权由代理透传,所以 token 仍写在 Claude Code 配置里即可。
+鉴权由代理透传，token 仍写在 Claude Code 配置里即可。
 
 ### 3. 验证
 
@@ -89,15 +48,68 @@ curl http://127.0.0.1:8787/__health
 # {"ok":true,"upstream":"https://api.deepseek.com/anthropic"}
 ```
 
-之后正常使用 Claude Code,400 报错会消失。
+之后正常使用 Claude Code，`400` 错误会消失。
 
-## 配置项(环境变量)
+## 工作原理
+
+```
+客户端 (Claude API 格式)
+    │  POST /v1/messages → 请求体含 system / adaptive / 缺失 thinking
+    ▼
+┌───────────────────┐     ┌───────────────────┐
+│  本代理 :8787      │ →  │  DeepSeek API      │
+│  · system 合并     │ ←  │  /anthropic         │
+│  · thinking 注入   │     └───────────────────┘
+│  · adaptive 修正   │
+│  · thinking 缓存   │
+└───────────────────┘
+```
+
+## 请求改写示意
+
+改写前 (Claude Code 发出):
+
+```json
+{
+  "system": "You are Claude Code.",
+  "messages": [
+    { "role": "user", "content": "hi" },
+    { "role": "system", "content": "mid-conversation note" },
+    { "role": "assistant", "content": "hello" }
+  ],
+  "thinking": { "type": "adaptive" }
+}
+```
+
+改写后 (转发给 DeepSeek):
+
+```json
+{
+  "system": [
+    { "type": "text", "text": "You are Claude Code." },
+    { "type": "text", "text": "mid-conversation note" }
+  ],
+  "messages": [
+    { "role": "user", "content": "hi" },
+    {
+      "role": "assistant",
+      "content": [
+        { "type": "thinking", "signature": "...", "thinking": "..." },
+        { "type": "text", "text": "hello" }
+      ]
+    }
+  ],
+  "thinking": { "type": "enabled" }
+}
+```
+
+## 配置项 (环境变量)
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `UPSTREAM_BASE_URL` | `https://api.deepseek.com/anthropic` | 真正的上游 Anthropic 兼容端点 |
 | `PROXY_HOST` | `127.0.0.1` | 代理监听地址 |
-| `PROXY_PORT` | `8787` | 代理监听端口(被占用时改这里,并同步改 settings 里的端口) |
+| `PROXY_PORT` | `8787` | 代理监听端口 |
 
 例如换端口启动:
 
@@ -107,10 +119,16 @@ $env:PROXY_PORT = "8800"; uv run main.py
 
 ## 设计取舍
 
-中间 `system` 消息采用**合并进顶层 `system`** 的策略:语义最贴近原意,但多个中间 `system` 消息的**位置信息**会丢失(全部按序拼接到 `system` 末尾)。对 Claude Code 的实际用法通常无影响,因为它插入的多是上下文提示而非位置敏感指令。若日后发现回答异常,可改为把 `role: "system"` 转成 `role: "user"` 的策略。
+- **中间 system 消息**采用合并进顶层 `system` 的策略：语义最贴近原意，但多个中间 system 的**位置信息**会丢失（全部拼接到 `system` 末尾）。对 Claude Code 的实际用法通常无影响。
+- **Thinking 注入**对最新一轮对话使用 DeepSeek 返回的真实签名，对更早的历史消息使用固定占位符签名。这能满足 Anthropic 协议的签名校验，同时不影响回答质量。
+- **Adaptive thinking** 直接转为 `enabled`，DeepSeek 会根据自身策略决定思考长度。
 
 ## 依赖
 
 - Python ≥ 3.10
 - `starlette`、`uvicorn`、`httpx`
-- 使用 [uv](https://docs.astral.sh/uv/) 管理:`uv sync` 安装依赖
+- 使用 [uv](https://docs.astral.sh/uv/) 管理：`uv sync` 安装依赖
+
+## 致谢
+
+Thinking 注入、Streaming 缓存、Adaptive Thinking 修正等思路来自 [deepseek-claude-proxy](https://github.com/GuanLuoFu/deepseek-claude-proxy)，感谢作者的探索和开源。
