@@ -21,13 +21,23 @@ Claude Code -> DeepSeek 兼容代理
 """
 
 import json
+import logging
 import os
+import time
+import uuid
 
 import httpx
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("proxy")
 
 # 真正的上游:DeepSeek 的 Anthropic 兼容端点。
 UPSTREAM_BASE_URL = os.environ.get(
@@ -144,6 +154,13 @@ async def proxy(request: Request) -> Response:
         headers=fwd_headers,
         content=rewritten,
     )
+
+    trace_id = uuid.uuid4().hex[:8]
+    path = request.url.path + ("?" + request.url.query if request.url.query else "")
+
+    log.info("%s | %s %s → ... | %sB", trace_id, request.method, path, f"{len(rewritten):,}")
+
+    t0 = time.monotonic()
     upstream_resp = await client.send(upstream_req, stream=True)
 
     resp_headers = {
@@ -159,6 +176,8 @@ async def proxy(request: Request) -> Response:
         finally:
             await upstream_resp.aclose()
             await client.aclose()
+            elapsed = time.monotonic() - t0
+            log.info("%s | %s %s ← %s | %.2fs", trace_id, request.method, path, upstream_resp.status_code, elapsed)
 
     return StreamingResponse(
         body_iter(),
@@ -183,6 +202,6 @@ app = Starlette(
 if __name__ == "__main__":
     import uvicorn
 
-    print(f"DeepSeek-CC proxy listening on http://{PROXY_HOST}:{PROXY_PORT}")
-    print(f"Forwarding to {UPSTREAM_BASE_URL}")
-    uvicorn.run(app, host=PROXY_HOST, port=PROXY_PORT, log_level="info")
+    print(f"DeepSeek-CC proxy -> http://{PROXY_HOST}:{PROXY_PORT}")
+    print(f"Upstream             {UPSTREAM_BASE_URL}")
+    uvicorn.run(app, host=PROXY_HOST, port=PROXY_PORT, log_level="warning")
