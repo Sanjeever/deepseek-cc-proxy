@@ -27,10 +27,27 @@ from starlette.routing import Route
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(message)s",
+    format="%(asctime)s  %(message)s",
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("proxy")
+
+# 抑制 httpx 自身的 INFO 日志 (格式不一致且无 trace_id)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+class ReqLog:
+    """Per-request logger: 自动为每条日志加上 [trace_id] 前缀。"""
+    __slots__ = ("tid",)
+
+    def __init__(self, tid: str) -> None:
+        self.tid = tid
+
+    def info(self, msg: str, *args: object) -> None:
+        if args:
+            log.info("[%s] %s", self.tid, msg % args)
+        else:
+            log.info("[%s] %s", self.tid, msg)
 
 UPSTREAM_BASE_URL = os.environ.get(
     "UPSTREAM_BASE_URL", "https://api.deepseek.com/anthropic"
@@ -97,7 +114,7 @@ def _has_thinking(msg: dict) -> bool:
     return False
 
 
-def _fix_missing_thinking(messages: list) -> None:
+def _fix_missing_thinking(messages: list, rlog: ReqLog) -> None:
     """为缺失 thinking 的 assistant 消息注入 thinking 块。
 
     从后往前遍历:
@@ -119,7 +136,7 @@ def _fix_missing_thinking(messages: list) -> None:
                     for block in content:
                         if isinstance(block, dict) and block.get("type") == "thinking":
                             _last_thinking_block = block
-                            log.info("更新 thinking 缓存 (来自请求中的 assistant 消息)")
+                            rlog.info("update thinking cache (from request)")
                             break
                 has_injected_latest = True
             continue
@@ -127,14 +144,14 @@ def _fix_missing_thinking(messages: list) -> None:
         # 缺失 thinking
         if not has_injected_latest and _last_thinking_block:
             _inject_thinking(msg, dict(_last_thinking_block))
-            log.info("注入缓存的真实 thinking 块到最新 assistant 消息")
+            rlog.info("inject cached thinking → latest assistant")
         else:
             _inject_thinking(msg, dict(_PLACEHOLDER_THINKING))
-            log.info("注入占位符 thinking 块到历史 assistant 消息")
+            rlog.info("inject placeholder thinking → history assistant")
         has_injected_latest = True
 
 
-def _capture_thinking_from_response(data: dict) -> None:
+def _capture_thinking_from_response(data: dict, rlog: ReqLog) -> None:
     """从非流式 (JSON) 响应中捕获 thinking 块并缓存。"""
     global _last_thinking_block
     content = data.get("content")
@@ -142,11 +159,11 @@ def _capture_thinking_from_response(data: dict) -> None:
         for block in content:
             if isinstance(block, dict) and block.get("type") == "thinking":
                 _last_thinking_block = block
-                log.info("缓存真实 thinking 块 (非流式)")
+                rlog.info("cache thinking (non-streaming)")
                 return
 
 
-def _build_sse_parser():
+def _build_sse_parser(rlog: ReqLog):
     """返回 (parse, finalize) 用于流式 SSE 响应中捕获 thinking。
 
     parse(chunk: bytes)  — 对每个 SSE chunk 调用
@@ -186,14 +203,14 @@ def _build_sse_parser():
                 "signature": state["signature"],
                 "thinking": state["thinking"],
             }
-            log.info("缓存真实 thinking 块 (流式, %d 字符)", len(state["thinking"]))
+            rlog.info("cache thinking (streaming, %d chars)", len(state["thinking"]))
 
     return parse, finalize
 
 
 # ── 请求改写 ────────────────────────────────────────────────────
 
-def rewrite_body(body: dict) -> dict:
+def rewrite_body(body: dict, rlog: ReqLog) -> dict:
     """请求体改写: system 清洗 + thinking 注入 + adaptive 修正。"""
 
     messages = body.get("messages")
@@ -223,13 +240,13 @@ def rewrite_body(body: dict) -> dict:
 
     # 2. Thinking 注入
     if isinstance(messages, list):
-        _fix_missing_thinking(messages)
+        _fix_missing_thinking(messages, rlog)
 
     # 3. Adaptive Thinking → enabled
     thinking = body.get("thinking")
     if isinstance(thinking, dict) and thinking.get("type") == "adaptive":
         thinking["type"] = "enabled"
-        log.info("修正 thinking.type: adaptive → enabled")
+        rlog.info("fix thinking.type: adaptive → enabled")
 
     return body
 
@@ -239,13 +256,16 @@ def rewrite_body(body: dict) -> dict:
 async def proxy(request: Request) -> StreamingResponse:
     raw = await request.body()
 
+    trace_id = uuid.uuid4().hex[:8]
+    rlog = ReqLog(trace_id)
+
     # 仅对 JSON body 改写;其余原样转发
     rewritten = raw
     if raw:
         try:
             body = json.loads(raw)
             if isinstance(body, dict):
-                body = rewrite_body(body)
+                body = rewrite_body(body, rlog)
                 rewritten = json.dumps(body).encode("utf-8")
         except (json.JSONDecodeError, UnicodeDecodeError):
             rewritten = raw
@@ -265,13 +285,8 @@ async def proxy(request: Request) -> StreamingResponse:
         request.method, url, headers=fwd_headers, content=rewritten,
     )
 
-    trace_id = uuid.uuid4().hex[:8]
     path = request.url.path + ("?" + request.url.query if request.url.query else "")
-
-    log.info(
-        "%s | %s %s → ... | %sB",
-        trace_id, request.method, path, f"{len(rewritten):,}",
-    )
+    rlog.info("→ %s %s  %sB", request.method, path, f"{len(rewritten):,}")
 
     t0 = time.monotonic()
     upstream_resp = await client.send(upstream_req, stream=True)
@@ -285,7 +300,7 @@ async def proxy(request: Request) -> StreamingResponse:
     content_type = upstream_resp.headers.get("content-type", "")
     is_stream = "event-stream" in content_type
 
-    sse_parse, sse_finalize = _build_sse_parser() if is_stream else (None, None)
+    sse_parse, sse_finalize = _build_sse_parser(rlog) if is_stream else (None, None)
     raw_chunks: list[bytes] = [] if not is_stream else []  # only used for non-stream
 
     async def body_iter():
@@ -300,10 +315,7 @@ async def proxy(request: Request) -> StreamingResponse:
             await upstream_resp.aclose()
             await client.aclose()
             elapsed = time.monotonic() - t0
-            log.info(
-                "%s | %s %s ← %s | %.2fs",
-                trace_id, request.method, path, upstream_resp.status_code, elapsed,
-            )
+            rlog.info("← %s  %.2fs", upstream_resp.status_code, elapsed)
 
             if sse_finalize:
                 sse_finalize()
@@ -312,11 +324,11 @@ async def proxy(request: Request) -> StreamingResponse:
                 try:
                     data = json.loads(full)
                     if upstream_resp.status_code == 400:
-                        log.info(
-                            "DeepSeek 返回 400: %s",
+                        rlog.info(
+                            "upstream 400: %s",
                             json.dumps(data, ensure_ascii=False),
                         )
-                    _capture_thinking_from_response(data)
+                    _capture_thinking_from_response(data, rlog)
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     pass
 
